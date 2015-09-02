@@ -8,6 +8,8 @@ class MountException(Exception):
     pass
 
 def get_client(**kwargs):
+    if "version" not in kwargs:
+        kwargs["version"] = "auto"
     return Client(**kwargs)
 
 def find_cgroup(hierarchy, docker_root):

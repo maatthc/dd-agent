@@ -48,7 +48,7 @@ instances:
     # docker.container.size_rootfs metrics.
     # Warning: This might take time for Docker daemon to generate,
     # ensure that `docker ps -a -q` run fast before enabling it.
-    # Defaults to true.
+    # Defaults to false.
     #
     # collect_container_size: false
 
@@ -111,9 +111,9 @@ instances:
     #   - container_name: Name of the container (example: "boring_euclid")
     #   - container_command: Command ran by the container (example: "echo 1")
     #
-    # performance_tags: ["image_name", "container_name"]
+    # performance_tags: ["container_name", image_name", "image_tag", "docker_image"]
 
     # Tags for containers count metrics.
     # Available: ["image_name", "image_tag", "docker_image", "container_command"]
     #
-    # container_tags: ["image_name"]
+    # container_tags: ["image_name", "image_tag", "docker_image"]

@@ -45,28 +45,44 @@ CGROUP_METRICS = [
     },
 ]
 
-def image_tag_extractor(c):
-    split = c["Image"].split(":", 1) if "Image" in c else c["RepoTags"][0].split(':', 1)
-    if len(split) == 1:
-        return None
-    return split[1]
+DEFAULT_CONTAINER_TAGS = [
+    "docker_image",
+    "image_name",
+    "image_tag",
+]
+
+DEFAULT_PERFORMANCE_TAGS = [
+    "container_name",
+    "docker_image",
+    "image_name",
+    "image_tag",
+]
+
+def image_tag_extractor(c, key):
+    if "Image" in c:
+        split = c["Image"].split(":", 1)
+        if len(split) <= key:
+            return None
+        else:
+            return [split[key]]
+    if "RepoTags" in c:
+        splits = [el.split(":", 1) for el in c["RepoTags"]]
+        tags = []
+        for split in splits:
+            if len(split) > key:
+                tags.append(split[key])
+        if len(tags) > 0:
+            return list(set(tags))
+    return None
+
 
 TAG_EXTRACTORS = {
-    "docker_image": lambda c: c["Image"],
-    "image_name": lambda c: c["Image"].split(':', 1)[0] if 'Image' in c else c["RepoTags"][0].split(':', 1)[0],
-    "image_tag": image_tag_extractor,
-    "container_command": lambda c: c["Command"],
-    "container_name": lambda c: c['Names'][0].lstrip("/") if c["Names"] else c['Id'][:11],
+    "docker_image": lambda c: [c["Image"]],
+    "image_name": lambda c: image_tag_extractor(c, 0),
+    "image_tag": lambda c: image_tag_extractor(c, 1),
+    "container_command": lambda c: [c["Command"]],
+    "container_name": lambda c: [c['Names'][0].lstrip("/")] if c["Names"] else [c['Id'][:11]],
 }
-
-
-"""WIP for a new docker check
-
-TODO:
- - Support a global "extra_tags" configuration, adding tags to all the metrics/events --> OK, need to test
- - Write tests
- - Test on all the platforms
-"""
 
 
 def get_mountpoints(docker_root):
@@ -111,7 +127,8 @@ class DockerDaemon(AgentCheck):
         # Just needs to be done once
         instance = instances[0]
         self.client = get_client(base_url=instance.get("url"), timeout=timeout)
-        self._mountpoints = get_mountpoints(init_config.get('docker_root', '/'))
+        self._docker_root = init_config.get('docker_root', '/')
+        self._mountpoints = get_mountpoints(self._docker_root)
         self._cgroup_filename_pattern = find_cgroup_filename_pattern(self._mountpoints)
         
         self.cgroup_listing_retries = 0
@@ -141,11 +158,10 @@ class DockerDaemon(AgentCheck):
 
         # Report performance container metrics (cpu, mem, net, io)
         self._report_performance_metrics(instance, containers_by_id)
-        # TODO: report container sizes (and image sizes?) --> OK - need to test
-        if _is_affirmative(instance.get('collect_container_size', True)):
+
+        if _is_affirmative(instance.get('collect_container_size', False)):
             self._report_container_size(instance, containers_by_id)
 
-        # TODO: bring events back --> OK - need to test
         # Send events from Docker API
         if _is_affirmative(instance.get('collect_events', True)):
             self._process_events(instance, containers_by_id)
@@ -177,8 +193,8 @@ class DockerDaemon(AgentCheck):
         must_query_size = _is_affirmative(instance.get('collect_container_size', False)) and self._latest_size_query == 0
         self._latest_size_query = (self._latest_size_query + 1) % SIZE_REFRESH_RATE
 
-        containers_running_count = Counter()
-        containers_stopped_count = Counter()
+        running_containers_count = Counter()
+        all_containers_count = Counter()
 
         try:
             containers = self.client.containers(all=True, size=must_query_size)
@@ -202,29 +218,31 @@ class DockerDaemon(AgentCheck):
             ecs_tags = self._get_ecs_tags()
             
         for container in containers:
-            custom_tags = []
+            custom_tags = instance.get('tags', [])
             if ecs_tags:
                 custom_tags += ecs_tags.get(container['Id'], [])
             container_name = container['Names'][0].strip('/')
-            tag_names = instance.get("container_tags", ["image_name"])
-            container_tags = self._get_tags(container, tag_names) + instance.get('tags', []) + custom_tags
-            # Check if the container is included/excluded via its tags
-            if self._is_container_running(container):
-                containers_running_count[tuple(sorted(container_tags))] += 1
-            else:
-                containers_stopped_count[tuple(sorted(container_tags))] += 1
 
+            tag_names = instance.get("container_tags", DEFAULT_CONTAINER_TAGS)
+            container_status_tags = self._get_tags(container, tag_names) + custom_tags
+
+            all_containers_count[tuple(sorted(container_status_tags))] += 1
+            if self._is_container_running(container):
+                running_containers_count[tuple(sorted(container_status_tags))] += 1
+
+            # Check if the container is included/excluded via its tags
             if self._is_container_excluded(container):
                 self.log.debug("Container {0} is excluded".format(container_name))
                 continue
 
             containers_by_id[container['Id']] = container
 
-        for tags, count in containers_running_count.iteritems():
+        for tags, count in running_containers_count.iteritems():
             self.gauge("docker.containers.running", count, tags=list(tags))
 
-        for tags, count in containers_stopped_count.iteritems():
-            self.gauge("docker.containers.stopped", count, tags=list(tags))
+        for tags, count in all_containers_count.iteritems():
+            stopped_count = count - running_containers_count[tags]
+            self.gauge("docker.containers.stopped", stopped_count, tags=list(tags))
 
         return containers_by_id
 
@@ -242,7 +260,8 @@ class DockerDaemon(AgentCheck):
         for tag_name in tag_names:
             tag_value = self._extract_tag_value(entity, tag_name)
             if tag_value is not None:
-                tags.append('%s:%s' % (tag_name, tag_value.strip()))
+                for t in tag_value:
+                    tags.append('%s:%s' % (tag_name, t.strip()))
 
         return tags
 
@@ -315,12 +334,14 @@ class DockerDaemon(AgentCheck):
         for container in containers_by_id.itervalues():
             if self._is_container_excluded(container):
                 continue
-            elif 'SizeRw' not in container or 'SizeRootFs' not in container:
-                continue
-            tag_names = instance.get("performance_tags", ["image_name", "container_name"])
+
+            tag_names = instance.get("performance_tags", DEFAULT_PERFORMANCE_TAGS)
             container_tags = self._get_tags(container, tag_names) + instance.get('tags', [])
-            self.gauge('docker.container.size_rw', container['SizeRw'], tags=container_tags)
-            self.gauge('docker.container.size_rootfs', container['SizeRootFs'], tags=container_tags)
+
+            if "SizeRw" in container:
+                self.gauge('docker.container.size_rw', container['SizeRw'], tags=container_tags)
+            if "SizeRootFs" in container:
+                self.gauge('docker.container.size_rootfs', container['SizeRootFs'], tags=container_tags)
 
     def _report_image_size(self, instance, images):
         for image in images:
@@ -338,7 +359,7 @@ class DockerDaemon(AgentCheck):
             if self._is_container_excluded(container) or not self._is_container_running(container):
                 continue
 
-            tag_names = instance.get("performance_tags", ["image_name", "container_name"])
+            tag_names = instance.get("performance_tags", DEFAULT_PERFORMANCE_TAGS)
             container_tags = self._get_tags(container, tag_names) + instance.get('tags', [])
 
             self._report_cgroup_metrics(container, container_tags)
@@ -510,13 +531,14 @@ class DockerDaemon(AgentCheck):
     # proc files
     def _crawl_container_pids(self, container_dict):
         """Crawl `/proc` to find container PIDs and add them to `containers_by_id`."""
-        for folder in os.listdir('/proc'):
+        proc_dir = os.path.join(self._docker_root, 'proc')
+        for folder in os.listdir(proc_dir):
             try:
                 int(folder)
             except ValueError:
                 continue
             try:
-                path = '/proc/%s/cgroup' % folder
+                path = os.path.join(proc_dir, folder, 'cgroup')
                 with open(path, 'r') as f:
                     content = [line.strip().split(':') for line in f.readlines()]
             except Exception, e:
@@ -528,7 +550,7 @@ class DockerDaemon(AgentCheck):
                 if 'docker/' in content.get('cpuacct'):
                     container_id = content['cpuacct'].split('docker/')[1]
                     container_dict[container_id]['_pid'] = folder
-                    container_dict[container_id]['_proc_root'] = '/proc/%s/' % folder
+                    container_dict[container_id]['_proc_root'] = os.path.join(proc_dir, folder)
             except Exception, e:
                 self.warning("Cannot parse %s content: %s" % (path, str(e)))
                 continue

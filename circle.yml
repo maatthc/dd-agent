@@ -1,6 +1,9 @@
 machine:
   services:
     - docker
+  environment:
+    VOLATILE_DIR: vol_dir
+    TRAVIS_BUILD_DIR: .
 
 general:
   branches:
