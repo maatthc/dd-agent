@@ -3,8 +3,9 @@ init_config:
 instances:
   - #   Talk to the PHP process using FCGI or HTTP protocol
     #
-    # If you want to monitor the FPM process directly (via TCP or Unix domain socket)
-    `listen` directive in the config, usually
+    # If you want to monitor the FPM process directly (via TCP or Unix domain socket),
+    # define monitoring_type as fcgi .
+    # You will also need the 'listen' directive in case you are using Unix domain socket
     monitoring_type: fcgi
 
     # If You use HTTP method, you should configured your fastcgi passthru (nginx/apache) to
